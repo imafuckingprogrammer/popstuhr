@@ -21,16 +21,12 @@ export default async function AnalyticsPage() {
   // Last 30 days of messages
   const thirtyDaysAgo = subDays(new Date(), 30).toISOString()
 
-  const [conversationsRes, widgetsRes] = await Promise.all([
+  const [conversationsRes] = await Promise.all([
     supabase
       .from('conversations')
       .select('id, status, created_at')
       .eq('org_id', org.id)
       .gte('created_at', thirtyDaysAgo),
-    supabase
-      .from('widgets')
-      .select('id, name')
-      .eq('org_id', org.id),
   ])
 
   const conversations = conversationsRes.data ?? []
