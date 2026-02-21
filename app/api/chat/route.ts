@@ -5,6 +5,20 @@ import { groq, GROQ_MODEL } from '@/lib/groq'
 export const runtime = 'nodejs'
 export const maxDuration = 30
 
+/** Strict hostname match: exact or valid subdomain */
+function isDomainAllowed(origin: string, allowed: string[]): boolean {
+  let hostname: string
+  try {
+    hostname = new URL(origin).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  return allowed.some(d => {
+    const domain = d.toLowerCase().replace(/^\./, '')
+    return hostname === domain || hostname.endsWith('.' + domain)
+  })
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -12,6 +26,11 @@ export async function POST(req: NextRequest) {
 
     if (!widget_id || !visitor_id || !message) {
       return Response.json({ error: 'Missing required fields' }, { status: 400 })
+    }
+
+    // Reject oversized messages before doing any DB work
+    if (typeof message !== 'string' || message.length > 2000) {
+      return Response.json({ error: 'Message too long' }, { status: 400 })
     }
 
     const supabase = await createServiceClient()
@@ -28,11 +47,10 @@ export async function POST(req: NextRequest) {
       return Response.json({ error: 'Widget not found or inactive' }, { status: 404 })
     }
 
-    // Domain restriction check
+    // Domain restriction check — exact hostname match, not substring
     const origin = req.headers.get('origin') ?? ''
     if (widget.allowed_domains && widget.allowed_domains.length > 0) {
-      const allowed = widget.allowed_domains.some((d: string) => origin.includes(d))
-      if (!allowed) {
+      if (!isDomainAllowed(origin, widget.allowed_domains)) {
         return Response.json({ error: 'Domain not allowed' }, { status: 403 })
       }
     }
@@ -49,8 +67,23 @@ export async function POST(req: NextRequest) {
       }, { status: 429 })
     }
 
-    // Get or create conversation
+    // Get or create conversation — validate existing conversation belongs to this widget
     let convId = conversation_id
+    if (convId) {
+      const { data: existingConv } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('id', convId)
+        .eq('widget_id', widget_id)
+        .eq('org_id', org.id)
+        .single()
+
+      if (!existingConv) {
+        // Supplied ID doesn't match this widget — start fresh
+        convId = null
+      }
+    }
+
     if (!convId) {
       const metadata: Record<string, string> = {}
       const referer = req.headers.get('referer')
@@ -83,7 +116,7 @@ export async function POST(req: NextRequest) {
 
     const historyMessages = (history ?? []).reverse()
 
-    // Load knowledge base
+    // Load knowledge base — cap total size to avoid blowing context window
     const { data: knowledge } = await supabase
       .from('knowledge_entries')
       .select('title, content')
@@ -91,14 +124,20 @@ export async function POST(req: NextRequest) {
       .eq('active', true)
       .limit(50)
 
-    const knowledgeText = (knowledge ?? [])
-      .map(k => `## ${k.title}\n${k.content}`)
-      .join('\n\n---\n\n')
+    let knowledgeText = ''
+    let totalChars = 0
+    const KNOWLEDGE_CHAR_LIMIT = 40000
+    for (const k of knowledge ?? []) {
+      const entry = `## ${k.title}\n${k.content}\n\n---\n\n`
+      if (totalChars + entry.length > KNOWLEDGE_CHAR_LIMIT) break
+      knowledgeText += entry
+      totalChars += entry.length
+    }
 
     // Build system prompt
     const systemPrompt = `You are a helpful customer service assistant for ${org.name}.
 
-${knowledgeText ? `KNOWLEDGE BASE:\n${knowledgeText}\n\n` : ''}INSTRUCTIONS:
+${knowledgeText ? `KNOWLEDGE BASE:\n${knowledgeText}` : ''}INSTRUCTIONS:
 - Answer questions based on the knowledge base above
 - If you don't know the answer, say so politely and suggest the customer contact the business directly
 - Be friendly, concise, and helpful
